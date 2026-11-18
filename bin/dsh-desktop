@@ -269,7 +269,7 @@ open_window() {
 # ---------------------------------------------------------------------------
 write_entry() {
   local browser="$1" id="$2" cls="$3"
-  local desc="$APP_NAME — the DeepSeek Harness web GUI in its own window"
+  local desc="Open the $APP_NAME web GUI in its own window"
   mkdir -p "$APP_DIR" "$ICON_DIR" || die "cannot create $APP_DIR"
 
   cp -f "$REPO_DIR/assets/$ICON_NAME.svg" "$ICON_DIR/$ICON_NAME.svg" 2>/dev/null ||
