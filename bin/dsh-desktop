@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+# dsh-desktop — run the DeepSeek Harness Web GUI as a real desktop app.
+#
+# Why this exists
+# ---------------
+# `dsh --profile web` is a server: it prints a URL and hands it to the default
+# browser. That makes the GUI a *tab* inside your everyday browser, so the
+# window belongs to the browser and its icon — you never get a DeepSeek icon.
+#
+# This tool gives the GUI a chromeless app window of its own, with a private
+# browser profile, and it makes the desktop shell attribute that window to the
+# DeepSeek entry. The last part has a non-obvious catch on GNOME:
+#
+#   shell-window-tracker.c resolves a window to an app by WM_CLASS, but for a
+#   window inside a sandbox it first computes
+#       app_prefix = "<sandbox-id>."
+#   and rejects every candidate desktop id that does not start with it.
+#
+# A Flatpak browser therefore only matches desktop entries whose *file id*
+# carries the Flatpak id: com.google.Chrome.dsh-web-app.desktop, not
+# dsh-web-app.desktop. This tool derives that id from the browser it finds, so
+# the same repo works with Flatpak Chrome/Chromium/Brave/Edge, distro Chrome,
+# and anywhere else (where the plain id is correct).
+#
+# Subcommands: run | install | uninstall | doctor | status | version
+set -uo pipefail
+
+APP_NAME="DeepSeek Harness"
+APP_ID="dsh-web-app"
+ICON_NAME="deepseek-harness"
+VERSION="1.0.0"
+
+DEFAULT_PORT="${DSH_DESKTOP_PORT:-3080}"
+BASE="http://127.0.0.1:${DEFAULT_PORT}"
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+APP_DIR="$DATA_HOME/applications"
+ICON_DIR="$DATA_HOME/icons/hicolor/scalable/apps"
+BIN_DIR="$HOME/.local/bin"
+# Keyed to APP_ID (not the tool name) on purpose: a machine that already ran an
+# earlier launcher keeps its server pid and token URL, so upgrading adopts the
+# running server instead of starting a second one on the same port.
+STATE_DIR="$STATE_HOME/$APP_ID"
+STATE_URL="$STATE_DIR/url"
+STATE_PID="$STATE_DIR/server.pid"
+STATE_LOG="$STATE_DIR/server.log"
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+REPO_DIR="$(cd "$(dirname "$SELF")/.." 2>/dev/null && pwd)"
+
+APP_CLASS="${DSH_DESKTOP_CLASS:-$APP_ID}"
+BROWSER="${DSH_DESKTOP_BROWSER:-}"      # flatpak:<id> | native:<bin> | xdg
+SANDBOX_OVERRIDE="${DSH_DESKTOP_SANDBOX_ID:-}"
+TAKEOVER="${DSH_DESKTOP_TAKEOVER:-0}"
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_OK=; C_WARN=; C_ERR=; C_DIM=; C_OFF=
+fi
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✔%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_WARN" "$C_OFF" "$*"; }
+fail() { printf '%s✘%s %s\n' "$C_ERR" "$C_OFF" "$*"; }
+die()  { fail "$*"; exit 1; }
+
+notify() {
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -a "$APP_NAME" "$APP_NAME" "$1" >/dev/null 2>&1
+  return 0
+}
+
+# Desktop sessions start with a minimal PATH; make the usual locations and
+# every nvm-installed node reachable before looking for `dsh`.
+prepare_path() {
+  local d
+  export PATH="$BIN_DIR:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+  for d in "$HOME"/.nvm/versions/node/*/bin "$HOME"/.volta/bin "$HOME"/.local/share/pnpm; do
+    [ -d "$d" ] && PATH="$d:$PATH"
+  done
+  export PATH
+}
+
+# ---------------------------------------------------------------------------
+# browser + sandbox detection
+# ---------------------------------------------------------------------------
+# Prints flatpak:<app-id>, native:<binary>, or xdg.
+detect_browser() {
+  if [ -n "$BROWSER" ]; then printf '%s\n' "$BROWSER"; return 0; fi
+
+  local id b
+  for id in com.google.Chrome org.chromium.Chromium com.brave.Browser \
+            com.microsoft.Edge io.github.ungoogled_software.ungoogled_chromium; do
+    if command -v flatpak >/dev/null 2>&1 && flatpak info "$id" >/dev/null 2>&1; then
+      printf 'flatpak:%s\n' "$id"; return 0
+    fi
+  done
+  for b in google-chrome google-chrome-stable chromium chromium-browser \
+           brave-browser microsoft-edge; do
+    if command -v "$b" >/dev/null 2>&1; then printf 'native:%s\n' "$b"; return 0; fi
+  done
+  printf 'xdg\n'
+}
+
+# The id the desktop shell sees for a sandboxed window, or empty when the
+# browser runs unconfined.
+sandbox_id_for() {
+  [ -n "$SANDBOX_OVERRIDE" ] && { printf '%s\n' "$SANDBOX_OVERRIDE"; return 0; }
+  case "$1" in
+    flatpak:*) printf '%s\n' "${1#flatpak:}" ;;
+    *)         printf '\n' ;;
+  esac
+}
+
+# desktop_entry_id <browser> -> file id that GNOME will accept for that window
+desktop_entry_id() {
+  local sandbox
+  sandbox="$(sandbox_id_for "$1")"
+  if [ -n "$sandbox" ]; then
+    printf '%s.%s.desktop\n' "$sandbox" "$APP_ID"
+  else
+    printf '%s.desktop\n' "$APP_ID"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# HTTP / server helpers
+# ---------------------------------------------------------------------------
+http_code() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null)
+  case "$code" in [0-9][0-9][0-9]) printf '%s' "$code" ;; *) printf '000' ;; esac
+}
+
+server_up() { [ "$(http_code "$BASE/")" != "000" ]; }
+
+listener_pid() {
+  local pid=""
+  if command -v ss >/dev/null 2>&1; then
+    pid=$(ss -ltnp "sport = :$DEFAULT_PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2)
+  fi
+  if [ -z "$pid" ] && command -v fuser >/dev/null 2>&1; then
+    pid=$(fuser -n tcp "$DEFAULT_PORT" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -n1)
+  fi
+  if [ -z "$pid" ] && command -v lsof >/dev/null 2>&1; then
+    pid=$(lsof -ti "tcp:$DEFAULT_PORT" -sTCP:LISTEN 2>/dev/null | head -n1)
+  fi
+  printf '%s' "$pid"
+}
+
+managed_pid() {
+  [ -s "$STATE_PID" ] || return 1
+  local pid; pid=$(head -n1 "$STATE_PID")
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && printf '%s' "$pid"
+}
+
+# The saved URL is a process credential: it is only good while the server that
+# printed it is alive, and it answers with a 303 -> ./ redirect when it is.
+saved_auth_url() {
+  [ -s "$STATE_URL" ] || return 1
+  local url; url=$(head -n1 "$STATE_URL")
+  [ -n "$url" ] && [ "$(http_code "$url")" = "303" ] && printf '%s\n' "$url"
+}
+
+find_dsh() {
+  local newest
+  if command -v dsh >/dev/null 2>&1; then command -v dsh; return 0; fi
+  newest=$(ls -dt "$HOME"/.npm/_npx/*/node_modules/.bin/dsh 2>/dev/null | head -n1)
+  if [ -n "$newest" ] && [ -x "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+  if command -v npx >/dev/null 2>&1; then printf 'npx\n'; return 0; fi
+  return 1
+}
+
+start_server() {
+  local found i url pid
+  if ! found=$(find_dsh); then
+    notify "Could not find dsh. Install @deepseek-ai/dsh or put it on PATH."
+    die "dsh not found"
+  fi
+  mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
+  : >"$STATE_LOG"
+
+  local cmd=()
+  if [ "$found" = "npx" ]; then cmd=(npx --yes @deepseek-ai/dsh)
+  else cmd=("$found"); fi
+
+  setsid nohup "${cmd[@]}" --profile web --no-open --port "$DEFAULT_PORT" \
+    >>"$STATE_LOG" 2>&1 </dev/null &
+  pid=$!
+  printf '%s\n' "$pid" >"$STATE_PID"
+
+  url=""
+  for i in $(seq 1 240); do
+    url=$(sed -e 's/\x1b\[[0-9;]*m//g' "$STATE_LOG" 2>/dev/null |
+          grep -oE 'https?://[^[:space:]"<>]*[?&]token=[A-Za-z0-9_-]+' | head -n1)
+    [ -n "$url" ] && break
+    if ! kill -0 "$pid" 2>/dev/null && ! server_up; then
+      notify "dsh failed to start; see $STATE_LOG"
+      die "dsh failed to start (log: $STATE_LOG)"
+    fi
+    sleep 0.5
+  done
+
+  if [ -z "$url" ]; then
+    server_up && { : >"$STATE_URL"; return 0; }
+    notify "Timed out waiting for dsh; see $STATE_LOG"
+    die "timed out waiting for dsh (log: $STATE_LOG)"
+  fi
+  printf '%s\n' "$url" >"$STATE_URL"
+}
+
+# ---------------------------------------------------------------------------
+# window
+# ---------------------------------------------------------------------------
+open_window() {
+  local url="$1" browser spec profile
+  local -a launch=() ozone=()
+
+  browser="$(detect_browser)"
+  case "$browser" in
+    flatpak:*)
+      spec="${browser#flatpak:}"
+      # A Flatpak only sees granted paths, so the profile must live under the
+      # app's own data dir; anywhere else silently falls back to the everyday
+      # profile, which turns the app window into a tab of the normal session.
+      profile="$HOME/.var/app/$spec/dsh-desktop-profile"
+      launch=(flatpak run "$spec")
+      ;;
+    native:*)
+      spec="${browser#native:}"
+      profile="$STATE_DIR/browser-profile"
+      launch=("$spec")
+      ;;
+    xdg)
+      warn "no Chromium-family browser found; the window will be a normal browser tab" >&2
+      exec xdg-open "$url"
+      ;;
+    *)
+      die "unrecognised DSH_DESKTOP_BROWSER: $BROWSER"
+      ;;
+  esac
+
+  mkdir -p "$profile" 2>/dev/null
+
+  # Wayland has no WM_CLASS: a Flatpak client's app id is its Flatpak id and
+  # --class is ignored, so force XWayland where --class is honoured and the
+  # desktop entry's StartupWMClass can match.
+  if [ -n "${DISPLAY:-}" ] && [ "${DSH_DESKTOP_X11:-1}" != "0" ]; then
+    ozone=(--ozone-platform=x11)
+  fi
+
+  exec "${launch[@]}" \
+    --user-data-dir="$profile" \
+    "${ozone[@]}" \
+    --class="$APP_CLASS" \
+    --app="$url" \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-session-crashed-bubble
+}
+
+# ---------------------------------------------------------------------------
+# .desktop entry
+# ---------------------------------------------------------------------------
+write_entry() {
+  local browser="$1" id="$2" cls="$3"
+  local desc="$APP_NAME — the DeepSeek Harness web GUI in its own window"
+  mkdir -p "$APP_DIR" "$ICON_DIR" || die "cannot create $APP_DIR"
+
+  cp -f "$REPO_DIR/assets/$ICON_NAME.svg" "$ICON_DIR/$ICON_NAME.svg" 2>/dev/null ||
+    warn "icon source not found; keeping the installed icon"
+
+  cat >"$APP_DIR/$id" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=$APP_NAME
+GenericName=AI Coding Agent
+Comment=$desc
+Exec="$BIN_DIR/dsh-desktop" run
+TryExec=$BIN_DIR/dsh-desktop
+Icon=$ICON_DIR/$ICON_NAME.svg
+Terminal=false
+StartupNotify=false
+StartupWMClass=$cls
+Categories=Development;
+Keywords=dsh;deepseek;harness;agent;ai;ai-agent;
+EOF
+  chmod 0644 "$APP_DIR/$id"
+  command -v update-desktop-database >/dev/null 2>&1 &&
+    update-desktop-database "$APP_DIR" >/dev/null 2>&1
+}
+
+# Only one entry may claim a StartupWMClass: GNOME prefers the id that matches
+# it exactly, so a leftover plain entry would beat the sandbox-prefixed one and
+# quietly restore the browser icon.
+remove_other_entries() {
+  local keep="$1" f
+  shopt -s nullglob
+  for f in "$APP_DIR"/*"$APP_ID".desktop; do
+    [ "$(basename "$f")" = "$keep" ] || { rm -f "$f"; ok "removed conflicting entry $(basename "$f")"; }
+  done
+  shopt -u nullglob
+}
+
+favorites_get() { gsettings get org.gnome.shell favorite-apps 2>/dev/null; }
+
+pin_dock() {
+  local id="$1" cur new
+  command -v gsettings >/dev/null 2>&1 || return 0
+  cur="$(favorites_get)" || return 0
+  [ -n "$cur" ] || return 0
+  case "$cur" in *"'$id'"*) ok "already pinned to the dock"; return 0 ;; esac
+  case "$cur" in
+    "@as []"|"[]"|"") new="['$id']" ;;
+    *) new="${cur%]}, '$id']" ;;
+  esac
+  gsettings set org.gnome.shell favorite-apps "$new" 2>/dev/null &&
+    ok "pinned to the dock"
+}
+
+unpin_dock() {
+  local id="$1" cur new
+  command -v gsettings >/dev/null 2>&1 || return 0
+  cur="$(favorites_get)" || return 0
+  case "$cur" in *"'$id'"*) ;; *) return 0 ;; esac
+  new="$(printf '%s' "$cur" | sed -e "s/'$id', *//g" -e "s/, *'$id'//g")"
+  [ "$new" != "$cur" ] && gsettings set org.gnome.shell favorite-apps "$new" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+cmd_run() {
+  prepare_path
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  local target=""
+
+  if ! server_up; then
+    start_server
+  else
+    local pid; pid="$(listener_pid)"
+    if [ -n "$pid" ] && [ "$(managed_pid 2>/dev/null || true)" != "$pid" ] && [ "$TAKEOVER" = "1" ]; then
+      # A server we did not detach holds the port (typically `dsh web` in a
+      # terminal). It would die with that terminal, so replace it.
+      notify "Taking over the DSH server holding port $DEFAULT_PORT"
+      kill -TERM "$pid" 2>/dev/null
+      for _ in $(seq 1 40); do server_up || break; sleep 0.25; done
+      server_up && kill -KILL "$pid" 2>/dev/null
+      start_server
+    fi
+  fi
+
+  target="$(saved_auth_url 2>/dev/null || true)"
+  [ -n "$target" ] || target="$BASE/"
+  open_window "$target"
+}
+
+cmd_install() {
+  local pin=1 browser id sandbox
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-pin) pin=0 ;;
+      --browser) shift; [ $# -gt 0 ] || die "--browser needs a value"; BROWSER="$1" ;;
+      --sandbox-id) shift; [ $# -gt 0 ] || die "--sandbox-id needs a value"; SANDBOX_OVERRIDE="$1" ;;
+      --port) shift; [ $# -gt 0 ] || die "--port needs a value"; DEFAULT_PORT="$1"; BASE="http://127.0.0.1:$1" ;;
+      *) die "unknown install flag: $1" ;;
+    esac
+    shift
+  done
+
+  browser="$(detect_browser)"
+  [ "$browser" = "xdg" ] && warn "no Chromium-family browser found — the app window will fall back to your default browser"
+  sandbox="$(sandbox_id_for "$browser")"
+  id="$(desktop_entry_id "$browser")"
+
+  mkdir -p "$BIN_DIR" "$ICON_DIR" || die "cannot create $BIN_DIR"
+  if [ "$SELF" != "$BIN_DIR/dsh-desktop" ]; then
+    install -m 0755 "$SELF" "$BIN_DIR/dsh-desktop" || die "cannot install to $BIN_DIR"
+  fi
+  ok "installed $BIN_DIR/dsh-desktop"
+  ok "icon      $ICON_DIR/$ICON_NAME.svg"
+  write_entry "$browser" "$id" "$APP_CLASS"
+  ok "entry     $APP_DIR/$id"
+  remove_other_entries "$id"
+  [ "$pin" = "1" ] && pin_dock "$id"
+
+  say ""
+  say "browser    $browser"
+  say "sandbox id ${sandbox:-none (unconfined)}"
+  say "window id  $APP_CLASS"
+  say ""
+  say "Launch it from the app grid, or: $BIN_DIR/dsh-desktop run"
+  say "Verify the desktop attribution: $BIN_DIR/dsh-desktop doctor"
+}
+
+cmd_uninstall() {
+  local browser id f
+  browser="$(detect_browser)"
+  id="$(desktop_entry_id "$browser")"
+  unpin_dock "$id"
+  unpin_dock "$APP_ID.desktop"
+  shopt -s nullglob
+  for f in "$APP_DIR"/*"$APP_ID".desktop; do rm -f "$f" && ok "removed $(basename "$f")"; done
+  shopt -u nullglob
+  rm -f "$ICON_DIR/$ICON_NAME.svg" && ok "removed icon"
+  if [ -s "$STATE_PID" ]; then
+    local pid; pid=$(head -n1 "$STATE_PID")
+    kill -TERM "$pid" 2>/dev/null && ok "stopped detached server (pid $pid)"
+  fi
+  rm -f "$BIN_DIR/dsh-desktop" && ok "removed $BIN_DIR/dsh-desktop"
+  say "state and browser profile left in $STATE_DIR (remove it to forget saved URLs)"
+}
+
+cmd_status() {
+  prepare_path
+  say "version     $VERSION"
+  say "port        $DEFAULT_PORT"
+  say "server      $(server_up && printf 'up' || printf 'down')"
+  local pid; pid="$(managed_pid 2>/dev/null || true)"
+  [ -n "$pid" ] && say "pid         $pid (detached, survives the window)"
+  [ -s "$STATE_URL" ] && say "saved url   $(sed 's/token=[^&]*/token=<redacted>/' "$STATE_URL")"
+  say "state dir   $STATE_DIR"
+  say "log         $STATE_LOG"
+}
+
+cmd_doctor() {
+  prepare_path
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --browser) shift; [ $# -gt 0 ] || die "--browser needs a value"; BROWSER="$1" ;;
+      --sandbox-id) shift; [ $# -gt 0 ] || die "--sandbox-id needs a value"; SANDBOX_OVERRIDE="$1" ;;
+      *) die "unknown doctor flag: $1" ;;
+    esac
+    shift
+  done
+  local rc=0 browser sandbox id cls f dup=0
+  browser="$(detect_browser)"
+  sandbox="$(sandbox_id_for "$browser")"
+  id="$(desktop_entry_id "$browser")"
+  cls="$APP_CLASS"
+
+  say "dsh-desktop $VERSION — desktop attribution check"
+  say ""
+  say "session     ${XDG_SESSION_TYPE:-unknown}${XDG_CURRENT_DESKTOP:+ ($XDG_CURRENT_DESKTOP)}"
+  say "display     ${DISPLAY:-none}${WAYLAND_DISPLAY:+ wayland:$WAYLAND_DISPLAY}"
+  say "browser     $browser"
+  say "sandbox id  ${sandbox:-none}"
+  say "window id   $cls"
+  say "entry id    $id"
+  say ""
+
+  if [ "$browser" = "xdg" ]; then
+    fail "no Chromium-family browser: grouping will follow your default browser"
+    rc=1
+  else
+    ok "Chromium-family browser found"
+  fi
+
+  if [ -n "$sandbox" ] && [ "${id#"$sandbox".}" = "$id" ]; then
+    fail "entry id lacks the '$sandbox.' prefix — the shell will reject it"
+    rc=1
+  else
+    ok "entry id satisfies the sandbox prefix rule"
+  fi
+
+  shopt -s nullglob
+  for f in "$APP_DIR"/*"$APP_ID".desktop; do
+    [ "$(basename "$f")" = "$id" ] || { dup=1; warn "competing entry $(basename "$f")"; }
+  done
+  shopt -u nullglob
+  [ "$dup" = "1" ] && { fail "more than one entry claims $cls; keep only $id"; rc=1; }
+
+  if [ -f "$APP_DIR/$id" ]; then
+    ok "entry present: $APP_DIR/$id"
+    grep -q "^StartupWMClass=$cls\$" "$APP_DIR/$id" &&
+      ok "StartupWMClass matches the window class" ||
+      { fail "StartupWMClass does not match $cls"; rc=1; }
+    grep -q "^Icon=" "$APP_DIR/$id" && ok "entry has an icon" || { warn "entry has no Icon="; }
+  else
+    fail "entry missing: run 'dsh-desktop install'"
+    rc=1
+  fi
+
+  [ -f "$ICON_DIR/$ICON_NAME.svg" ] && ok "icon installed" || { warn "icon not installed"; }
+
+  if [ -n "${DISPLAY:-}" ] && command -v xprop >/dev/null 2>&1; then
+    local w found=0
+    for w in $(xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -oE '0x[0-9a-f]+'); do
+      case "$(xprop -id "$w" WM_CLASS 2>/dev/null)" in
+        *"\"$cls\""*) found=1; ok "running window $w reports WM_CLASS \"$cls\"" ;;
+      esac
+    done
+    [ "$found" = "0" ] && warn "no running window with WM_CLASS \"$cls\" (open the app to re-check)"
+  else
+    warn "no X display: cannot inspect running windows (Wayland-only session?)"
+  fi
+
+  say ""
+  if [ "$rc" = "0" ]; then
+    ok "verdict: a new window will be attributed to $APP_NAME"
+    say "${C_DIM}Windows created before the entry existed keep their old app until reopened.${C_OFF}"
+  else
+    fail "verdict: the window will not be attributed to $APP_NAME"
+  fi
+  return "$rc"
+}
+
+usage() {
+  cat <<EOF
+$APP_NAME desktop launcher $VERSION
+
+usage: dsh-desktop <command>
+
+commands
+  run                  start/reuse the DSH server and open the app window
+  install [flags]      install the launcher, icon and desktop entry
+  uninstall            remove them and stop the detached server
+  doctor               check that the window will get the DeepSeek icon
+  status               show server, port and state
+  version              print the version
+
+install flags
+  --no-pin             do not pin the entry to the GNOME dock
+  --browser SPEC       flatpak:<app-id> | native:<binary> | xdg
+  --sandbox-id ID      override the sandbox id used in the entry id
+  --port N             port to use (default $DEFAULT_PORT)
+
+environment
+  DSH_DESKTOP_PORT        server port (default 3080)
+  DSH_DESKTOP_BROWSER     force the browser, as with --browser
+  DSH_DESKTOP_SANDBOX_ID  force the sandbox id
+  DSH_DESKTOP_CLASS       window class (default $APP_ID)
+  DSH_DESKTOP_X11=0       do not force XWayland
+  DSH_DESKTOP_TAKEOVER=1  replace a server that belongs to a terminal
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; [ $# -gt 0 ] && shift
+  case "$cmd" in
+    run)       cmd_run "$@" ;;
+    install)   cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    doctor)    cmd_doctor "$@" ;;
+    status)    cmd_status "$@" ;;
+    version|-V|--version) say "$VERSION" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
