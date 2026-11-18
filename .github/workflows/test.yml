@@ -5,11 +5,13 @@ on:
   pull_request:
 
 jobs:
-  smoke:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Syntax check
-        run: bash -n bin/dsh-desktop install.sh uninstall.sh tests/smoke.sh
-      - name: Smoke test (throwaway HOME)
+        run: bash -n bin/dsh-desktop install.sh uninstall.sh tests/smoke.sh tests/lifecycle.sh
+      - name: Smoke test (install/doctor/uninstall in a throwaway HOME)
         run: bash tests/smoke.sh
+      - name: Lifecycle test (stubbed dsh + server reuse + token fallback)
+        run: bash tests/lifecycle.sh
